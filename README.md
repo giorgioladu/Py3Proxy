@@ -58,6 +58,16 @@ py3proxy --port 110 -d
 
 ---
 
+## ⚠️ Disclaimer
+
+This software is provided **as-is**, without any warranty of any kind.  
+The authors and contributors are **not responsible** for any data loss, email corruption, service disruption, or other damages resulting from the use of this software.
+
+**Py3Proxy is intended for testing, research, and educational purposes only**.  
+It is **not recommended for production environments** or critical email infrastructure.
+
+---
+
 ## 📜 License
 
 This project is licensed under the GNU GPLv2 — see the LICENSE file for details.
