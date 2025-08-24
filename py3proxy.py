@@ -30,7 +30,10 @@ import logging
 import sys
 import asyncio
 from kittengroomer_email.mail import KittenGroomerMail
+import optparse
+import re
 
+VERSION = "1.0"
 OK = '+OK'
 ERR = '-ERR'
 
@@ -119,19 +122,19 @@ class POP3Backend(object):
         self.protocol = protocol
 
     def authenticate(self, username=None, password=None):
-        raise POP3BackendException('Implement authenticate')
+        raise POP3BackendException('Implement authenticate.')
 
     def fetch(self):
-        raise POP3BackendException('Implement fetch')
+        raise POP3BackendException('Implement fetch.')
 
     def delete(self, num=None):
-        raise POP3BackendException('Implement delete')
+        raise POP3BackendException('Implement delete.')
 
     def cleanup(self):
-        raise POP3BackendException('Implement cleanup')
+        raise POP3BackendException('Implement cleanup.')
 
     def revert(self):
-        raise POP3BackendException('Implement revert')
+        raise POP3BackendException('Implement revert.')
 
     def destroy(self):
         pass
@@ -222,36 +225,52 @@ class POP3Backend_IMAP(POP3Backend):
                     r, c = self._imap.fetch(seq, '(RFC822)')
                     if r != 'OK' or not c or not c[0]:
                         continue
-                    raw = c[0][1]
 
-                    # 1. Esegui la scansione ClamAV
-                    scan_result = 'DISABLED'
-                    if self.clamd_host and self.clamd_port:
-                        scan_result = asyncio.run(scan_bytes_with_clam_async(raw, self.clamd_host, self.clamd_port))
+                    raw_bytes = c[0][1]
 
-                    # 2. Esegui la sanitizzazione con PyCIRCLeanMail
-                    pyc_result = scan_with_pycircleanmail(raw)
+                    # 1. Analizza il messaggio originale per estrarre gli header
+                    try:
+                        # Correggi gli header prima che vengano analizzati in un oggetto email
+                        corrected_bytes = fix_header_folding(raw_bytes)
+                        original_msg = email.message_from_bytes(corrected_bytes)
+                    except Exception as e:
+                        logger.error(f"Error parsing original message (seq={seq}): {e}")
+                        continue
 
-                    # 3. Crea un POP3Message dal risultato pulito
-                    popmsg = POP3Message(content=pyc_result)
+                    # 2. Esegui la sanificazione con PyCIRCLeanMail
+                    pyc_result_bytes = scan_with_pycircleanmail(corrected_bytes)
+
+                    # 3. Crea un nuovo messaggio dall'output sanificato
+                    popmsg_sanitized = email.message_from_bytes(pyc_result_bytes)
+                    #popmsg_sanitized = email.message_from_bytes(fix_header_folding(raw_bytes))
 
                     # 4. Aggiungi gli header di stato
-                    if "VIRUS FOUND" in scan_result:
-                        popmsg.content.add_header('X-ClamAV-Status', 'Infected')
-                    elif scan_result.startswith('ERROR'):
-                        popmsg.content.add_header('X-ClamAV-Status', scan_result)
-                    else:
-                        popmsg.content.add_header('X-ClamAV-Status', 'Clean')
+                    scan_result = 'DISABLED'
+                    if self.clamd_host and self.clamd_port:
+                        scan_result = asyncio.run(scan_bytes_with_clam_async(raw_bytes, self.clamd_host, self.clamd_port))
 
-                    if pyc_result != raw:
-                        popmsg.content.add_header('X-PyCIRCLeanMail-Status', 'Sanitized')
+                    if "VIRUS FOUND" in scan_result:
+                        popmsg_sanitized.add_header('X-ClamAV-Status', 'Infected')
+                    elif scan_result.startswith('ERROR'):
+                        popmsg_sanitized.add_header('X-ClamAV-Status', scan_result)
+                    else:
+                        popmsg_sanitized.add_header('X-ClamAV-Status', 'Clean')
+
+                    if pyc_result_bytes != raw_bytes:
+                        popmsg_sanitized.add_header('X-PyCIRCLeanMail-Status', 'Sanitized')
                         logger.debug(f"PyCIRCLeanMail result: sanitized")
                     else:
-                        popmsg.content.add_header('X-PyCIRCLeanMail-Status', 'Clean')
+                        popmsg_sanitized.add_header('X-PyCIRCLeanMail-Status', 'Clean')
                         logger.debug(f"PyCIRCLeanMail result: clean")
 
-                    # 5. Aggiungi l'oggetto completo alla lista
-                    self.protocol.messages.append(popmsg)
+                    # 5. Copia tutti gli header dal messaggio originale a quello sanificato
+                    #    Questo preserva Subject, Date, From, ecc.
+                    for header, value in original_msg.items():
+                        if header not in popmsg_sanitized:
+                            popmsg_sanitized[header] = value
+
+                    # 6. Aggiungi l'oggetto completo e modificato alla lista
+                    self.protocol.messages.append(POP3Message(content=popmsg_sanitized.as_bytes()))
                     self.imap_ids.append(seq)
 
                 except Exception as e:
@@ -352,6 +371,7 @@ class POP3Backend_IMAPS(POP3Backend_IMAP):
 
 # --------------------------- POP3 wire --------------------------------
 
+# Nel file py3proxy.py, modifica la classe POP3Message
 class POP3Message(object):
     """Represents a POP3 message."""
     def __init__(self, content=None):
@@ -365,12 +385,18 @@ class POP3Message(object):
             except Exception as e:
                 logger.error(f'Error parsing message content: {e}')
 
-    def get_headers(self):
-        if not self.content:
-            return ''
-        return '\r\n'.join(f'{k}: {v}' for k, v in self.content.items())
+    # def get_headers(self):
+        # """Restituisce solo gli header del messaggio, in formato stringa."""
+        # if not self.content:
+            # return ''
+        # headers = []
+        # for header, value in self.content.items():
+            # headers.append(f"{header}: {value}")
+        # # Restituisce una stringa con gli header
+        # return '\r\n'.join(headers)
 
     def get_body(self):
+        """Restituisce il corpo del messaggio in formato stringa."""
         if not self.content:
             return ''
         if self.content.is_multipart():
@@ -381,10 +407,7 @@ class POP3Message(object):
                 try:
                     parts.append(part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', 'replace'))
                 except Exception:
-                    try:
-                        parts.append(part.get_payload(decode=True).decode('utf-8', 'replace'))
-                    except Exception:
-                        parts.append(part.get_payload())
+                    parts.append(part.get_payload())
             return '\r\n'.join(p for p in parts if p)
         else:
             try:
@@ -393,12 +416,31 @@ class POP3Message(object):
                 return self.content.get_payload()
 
     def as_string(self):
+        """return the complete message"""
         return self.content.as_string() if self.content else ''
+
+    def as_byte(self):
+        """Restituisce il messaggio completo in formato byte."""
+        return self.content.as_bytes() if self.content else b''
 
     def unique_id(self):
         msgid = (self.content.get('Message-ID') or '').encode()
         key = msgid or self.content.as_bytes()
         return md5(key).hexdigest()
+
+    def __len__(self):
+        return len(self.as_string().encode('utf-8', 'replace'))
+
+    # Aggiungere alla classe POP3Message
+    def get_headers_only(self):
+        """Restituisce solo gli header del messaggio in formato bytes."""
+        headers = []
+        for header, value in self.content.items():
+            headers.append(f"{header}: {value}\r\n")
+         # Aggiungi una riga vuota per separare gli header dal corpo
+        headers.append("\r\n\r\n")
+        return "".join(headers)
+
 
     def __len__(self):
         return len(self.as_string().encode('utf-8', 'replace'))
@@ -420,14 +462,14 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
     # ---- helpers ----
     def _send_response(self, response):
         logger.debug(f'S: {response}')
-        data = (response + '\r\n').encode('ascii', 'ignore')
+        data = (response + '\r\n').encode('ascii', 'replace')
         self.request.sendall(data)
 
     def _send_multiline(self, header_line, lines):
-        self.request.sendall((header_line + '\r\n').encode('ascii', 'ignore'))
+        self.request.sendall((header_line + '\r\n').encode('ascii', 'replace'))
         for line in lines:
             # dot-stuffing if needed could be added here; most MUAs won't send lines starting with '.' in LIST/UIDL
-            self.request.sendall((line + '\r\n').encode('ascii', 'ignore'))
+            self.request.sendall((line + '\r\n').encode('ascii', 'replace'))
         self.request.sendall(b'.\r\n')
 
     def _send_error(self, message):
@@ -435,8 +477,39 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
 
     def _check_state(self, allowed):
         if self.state not in allowed:
-            return f'invalid state for command {self.data.split()[0].decode("ascii", "ignore")}'
+            return f'invalid state for command {self.data.split()[0].decode("ascii", "replace")}'
         return None
+
+      # Modifica il metodo TOP in POP3Protocol
+    def do_top(self, msgid=None, lines=0):
+        if msgid is None or lines is None:
+            self.send_response(ERR)
+            return
+
+        msgid = int(msgid)
+        if msgid > len(self.messages):
+            self.send_response(ERR, 'no such message')
+            return
+
+        # Se lines è 0, restituisci solo gli header
+        if lines == 0:
+            headers = self.messages[msgid - 1].get_headers_only()
+            self.send_response(OK, 'message follows')
+            self.sock.sendall(headers + b'.\r\n')
+            logger.debug(f'Sent headers for message {msgid}')
+        else:
+            # Per TOP con righe, si può usare il metodo RETR e troncare, o implementare una logica più complessa.
+            # Per ora, si può reindirizzare a RETR e troncare manualmente.
+            # Oppure, per semplicità, fai RETR e poi tronca il corpo
+            full_message = self.messages[msgid - 1].content.as_bytes()
+
+            # Implementazione semplice che prende il messaggio completo e poi lo taglia
+            # per una soluzione più robusta, dovresti parse il messaggio e troncare solo il body
+            headers_end_index = full_message.find(b'\r\n\r\n') + 4
+            headers_and_body = full_message[:headers_end_index] + b'...\r\n'
+            self.send_response(OK, 'message follows')
+            self.sock.sendall(headers_and_body + b'.\r\n')
+            logger.debug(f'Sent TOP for message {msgid} with {lines} lines')
 
     # ---- POP3 commands ----
     def QUIT(self):
@@ -447,10 +520,19 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
         self.state = 'closed'
         if self._pop3user:
             MLock.release_mailbox(self._pop3user)
-        self._send_response(f'{OK} POP3 server signing off')
+        self._send_response(f'{OK} POP3 server signing off.')
 
     def CAPA(self):
-        caps = ['TOP', 'UIDL', 'RESP-CODES']
+        #CAPA
+        # TOP
+        # UIDL
+        # RESP-CODES
+        # PIPELINING
+        # AUTH-RESP-CODE
+        # STLS
+        # USER
+        # SASL PLAIN LOGIN
+        caps = ['TOP', 'UIDL', 'RESP-CODES', 'USER', 'AUTH-RESP-CODE']
         self._send_multiline(OK, caps)
 
     def STAT(self):
@@ -471,7 +553,7 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
 
         if msg:
             try:
-                idx = int(msg.decode('ascii', 'ignore'))
+                idx = int(msg.decode('ascii', 'replace'))
                 m = self.messages[idx - 1]  # may raise
                 self._send_response(f'{OK} {idx} {len(m)}')
             except Exception:
@@ -487,13 +569,13 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
         if not self.messages and not self.backend.fetch():
             return self._send_error(self.backend.state or 'backend fetch failed')
         try:
-            idx = int(msg.decode('ascii', 'ignore'))
+            idx = int(msg.decode('ascii', 'replace'))
             m = self.messages[idx - 1]
             head = f'{OK} {len(m)} octets\r\n'
-            self.request.sendall(head.encode('ascii', 'ignore'))
+            self.request.sendall(head.encode('ascii', 'replace'))
             # Send message bytes followed by CRLF and final dot
-            raw = m.as_string().encode('utf-8', 'replace')
-            self.request.sendall(raw + b'\r\n.\r\n')
+            raw = m.as_byte() + b'\r\n.\r\n'
+            self.request.sendall(raw )
         except Exception as e:
             self._send_error(f'no such message')
 
@@ -504,7 +586,7 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
         if not self.messages and not self.backend.fetch():
             return self._send_error(self.backend.state or 'backend fetch failed')
         try:
-            idx_str = msg.decode('ascii', 'ignore')
+            idx_str = msg.decode('ascii', 'replace')
             _ = self.messages[int(idx_str) - 1]  # validate exists
             if not self.backend.delete(idx_str):
                 return self._send_error(self.backend.state or 'delete failed')
@@ -531,23 +613,40 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
         self._send_response(f'{OK} maildrop has {len(self.messages)} messages ({total} octets)')
 
     def TOP(self, args=None):
-        err = self._check_state(('transaction',))
-        if err:
-            return self._send_error(err)
-        if not args:
-            return self._send_error('command TOP requires arguments')
-        if not self.messages and not self.backend.fetch():
-            return self._send_error(self.backend.state or 'backend fetch failed')
-        try:
-            msgno_b, lines_b = args.split(None, 1)
-            msgno = int(msgno_b.decode('ascii', 'ignore'))
-            lines = int(lines_b.decode('ascii', 'ignore'))
-            m = self.messages[msgno - 1]
-            body_lines = m.get_body().splitlines()[:lines]
-            header = m.get_headers()
-            self._send_multiline(OK, [header, *body_lines])
-        except Exception:
-            self._send_error('no such message or invalid arguments')
+            err = self._check_state(('transaction',))
+            if err:
+                return self._send_error(err)
+            if not args:
+                return self._send_error('command TOP requires arguments')
+
+            # Carica i messaggi se non sono già disponibili
+            if not self.messages and not self.backend.fetch():
+                return self._send_error(self.backend.state or 'backend fetch failed')
+
+            try:
+                msgno_b, lines_b = args.split(None, 1)
+                msgno = int(msgno_b.decode('utf8', 'replace'))
+                lines = int(lines_b.decode('utf8', 'replace'))
+
+                # Controlla se il messaggio esiste
+                if msgno < 1 or msgno > len(self.messages):
+                    return self._send_error('no such message')
+
+                m = self.messages[msgno - 1]
+                header = m.get_headers_only()
+
+                # Se il client richiede 0 linee, invia solo gli header
+                if lines == 0:
+                    self._send_multiline(OK, [header])
+                    logger.debug(f"TOP {msgno} 0: Sent only headers")
+                else:
+                    # Invia header e le prime 'lines' del corpo
+                    body_lines = m.get_body().splitlines()[:lines]
+                    self._send_multiline(OK, [header] + body_lines)
+                    logger.debug(f"TOP {msgno} {lines}: Sent headers and {lines} body lines")
+
+            except (ValueError, IndexError):
+                self._send_error('no such message or invalid arguments')
 
     def UIDL(self, msg=None):
         err = self._check_state(('transaction',))
@@ -571,7 +670,7 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
             return self._send_error('invalid state for command USER')
         if not name:
             return self._send_error('invalid username')
-        user = name.decode('ascii', 'ignore')
+        user = name.decode('ascii', 'replace')
         self._pop3user = user
         self.host = user.partition('@')[2] or None
         if self.backend:
@@ -588,12 +687,12 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
             return self._send_error('username not specified')
         if MLock.is_locked(self._pop3user):
             return self._send_error('maildrop already locked')
-        self._pop3pass = credentials.decode('ascii', 'ignore')
+        self._pop3pass = credentials.decode('ascii', 'replace')
         if not self.backend.authenticate(self._pop3user, self._pop3pass):
             return self._send_error('invalid username or password')
         if MLock.acquire_mailbox(self._pop3user):
             self.state = 'transaction'
-            self._send_response(f'{OK} maildrop locked and ready')
+            self._send_response(f'{OK} Logged in.')
         else:
             self._send_error('unable to lock maildrop')
 
@@ -604,7 +703,7 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
                 break
             try:
                 parts = self.data.strip().split(None, 1)
-                cmd = parts[0].decode('ascii', 'ignore').upper()
+                cmd = parts[0].decode('ascii', 'replace').upper()
                 args = parts[1] if len(parts) > 1 else None
                 logger.debug(f'C: {cmd} {args or ""}')
                 fn = getattr(self, cmd, None)
@@ -680,22 +779,80 @@ def main(options):
     finally:
         server.shutdown()
 
+def fix_header_folding(raw_email: bytes) -> bytes:
+    # Converti sequenze di spazi inizio riga -> TAB
+    fixed = re.sub(rb'\r\n {2,}', b'\r\n\t', raw_email)
+    return fixed
 
-if __name__ == '__main__':
-    import optparse
+def print_help():
+    help_text = fr"""
+=============================================================
+                        Py3Proxy v{VERSION}
+          POP3 Proxy with IMAP/IMAPS backend support
+=============================================================
 
-    parser = optparse.OptionParser()
+Usage: py3proxy.py [OPTIONS]
+
+Options:
+   -h, --help           Show this help screen
+   -d, --debug          Run in debug mode (verbose logging)
+   -p, --port <PORT>    POP3 listening port (default: 1100)
+   -H, --host <HOST>    POP3 listening host (default: 127.0.0.1)
+   --timeout            Backend socket timeout (default=10.0s )
+   --clamd_host         ClamAV clamd host
+   --clamd_port         ClamAV clamd port (3310)
+   -b, --backend <URL>  IMAP/IMAPS backend server
+   -u, --user <USER>    Backend username
+   -P, --pass <PASS>    Backend password
+   --debug              Enable debug logging
+   -v, --version        Show version info
+
+-------------------------------------------------------------
+Notes:
+ - Logs are stored in /tmp/py3proxy.log
+ - This software is experimental and NOT for production use
+-------------------------------------------------------------
+
+Example:
+   py3proxy.py -p 1100 -H 127.0.0.1 -b imaps://imap.gmail.com:993 \
+               -u alice@example.com -P secret
+=============================================================
+"""
+    print(help_text)
+    sys.exit(0)
+
+def parse_args():
+    parser = optparse.OptionParser(add_help_option=False)
+
     parser.add_option('-b', '--backend', action='store', default='IMAPS', help='IMAP or IMAPS')
     parser.add_option('--backend_address', action='store', help='IMAP server address')
     parser.add_option('--backend_port', action='store', type=int, default=993, help='IMAP/IMAPS port')
     parser.add_option('--timeout', action='store', type=float, default=10.0, help='Backend socket timeout (s)')
-    parser.add_option('--clamd_host', action='store', default=None, help='ClamAV clamd host (optional)')
-    parser.add_option('--clamd_port', action='store', type=int, default=3310, help='ClamAV clamd port')
+    parser.add_option('--clamd_host', action='store', default=None,help='ClamAV clamd host (optional)')
+    parser.add_option('--clamd_port', action='store', type=int, default=3310, help='ClamAV clamd port (3310)')
     parser.add_option('-l', '--listen', action='store', default='127.0.0.1', help='Listen address (POP3)')
-    parser.add_option('-p', '--port', action='store', type=int, default=110, help='Listen port (POP3)')
-    parser.add_option('-d', '--debug', action='store_true', default=False, help='Enable debug logging')
+    parser.add_option('-p', '--port', action='store', type=int, default=110, help='Listen port (POP3 110)')
+    parser.add_option('-d', '--debug', action='store_true', default=True, help='Enable debug logging')
+    parser.add_option('-h', '--help', action='store_true', help='Show this help screen')
+    parser.add_option('-v', '--version', action='store_true', help='Show version info')
 
-    (options, _remain) = parser.parse_args()
+    (options, args) = parser.parse_args()
+
+    if options.help:
+        print_help()
+        sys.exit(0)
+
+    if options.version:
+        print(f"Py3Proxy version {VERSION}")
+        sys.exit(0)
+
+    return options
+
+if __name__ == '__main__':
+
+    options = parse_args()
+    print(f"Starting Py3Proxy on {options.listen}:{options.port} (Backend: {options.backend})")
+
     if options.debug:
         logger.setLevel(logging.DEBUG)
 
