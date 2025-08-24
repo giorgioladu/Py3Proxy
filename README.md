@@ -34,7 +34,7 @@ pip install imapclient python-daemon socketserver lockfile
 ##  ⚙️ Usage
 Run the proxy with an IMAPS backend:
 ```bash
-py3proxy --port 110 -d
+py3proxy --port 110 
 ```
 *Configuration Options*
 
@@ -48,7 +48,6 @@ py3proxy --port 110 -d
 -p, --port	The POP3 proxy's listening port	110
 --timeout	The backend socket timeout (in seconds)	10.0
 -d, --debug	Enables debug logging	False
---daemon	Runs the proxy in daemon mode	False
 ```
 
 ---
