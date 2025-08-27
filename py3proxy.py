@@ -20,20 +20,21 @@
 
 import email
 from email.utils import formatdate, make_msgid
+from email import policy
 from uuid import uuid5, NAMESPACE_DNS
 from time import time
 from hashlib import md5
 from imaplib import IMAP4, IMAP4_SSL
 import socketserver
+import socket
 import threading
 import logging
 import sys
-import asyncio
 from kittengroomer_email.mail import KittenGroomerMail
 import optparse
 import re
 
-VERSION = "1.0"
+VERSION = "1.56 27.08.2025"
 OK = '+OK'
 ERR = '-ERR'
 
@@ -57,38 +58,27 @@ monitoring test %s
 
 # ----------------------------- ClamAV ---------------------------------
 
-async def scan_bytes_with_clam_async(data: bytes, host: str, port: int, chunk_size: int = 8192, timeout: float = 10.0) -> str:
-    """Scan arbitrary bytes via ClamAV's INSTREAM protocol asynchronously."""
+def scan_bytes_with_clam(data: bytes, host: str, port: int, chunk_size: int = 8192, timeout: float = 10.0) -> str:
+    """Scan arbitrary bytes via ClamAV's INSTREAM protocol (synchronous)."""
     if isinstance(data, str):
         data = data.encode('utf-8', 'replace')
 
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-        writer.write(b'zINSTREAM\n')
-        await writer.drain()
-        for i in range(0, len(data), chunk_size):
-            chunk = data[i:i + chunk_size]
-            writer.write(len(chunk).to_bytes(4, 'big'))
-            writer.write(chunk)
-            await writer.drain()
-        writer.write(b'\x00\x00\x00\x00')
-        await writer.drain()
-        response = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(b'zINSTREAM\n')
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                sock.sendall(len(chunk).to_bytes(4, 'big'))
+                sock.sendall(chunk)
+            sock.sendall(b'\x00\x00\x00\x00')
+
+            response = sock.recv(4096)
 
         response_str = (response or b'').decode('utf-8', 'replace').strip()
-        if 'FOUND' in response_str:
-            return 'VIRUS FOUND'
-        if 'OK' in response_str:
-            return 'OK'
-        return response_str or 'UNKNOWN'
+        return response_str or 'ERROR'
+
     except Exception as e:
         return f'ERROR: {e}'
-
 
 def scan_with_pycircleanmail(raw_bytes: bytes) -> bytes:
     """
@@ -232,7 +222,7 @@ class POP3Backend_IMAP(POP3Backend):
                     try:
                         # Correggi gli header prima che vengano analizzati in un oggetto email
                         corrected_bytes = fix_header_folding(raw_bytes)
-                        original_msg = email.message_from_bytes(corrected_bytes)
+                        original_msg = email.message_from_bytes(corrected_bytes, policy=policy.default)
                     except Exception as e:
                         logger.error(f"Error parsing original message (seq={seq}): {e}")
                         continue
@@ -241,15 +231,15 @@ class POP3Backend_IMAP(POP3Backend):
                     pyc_result_bytes = scan_with_pycircleanmail(corrected_bytes)
 
                     # 3. Crea un nuovo messaggio dall'output sanificato
-                    popmsg_sanitized = email.message_from_bytes(pyc_result_bytes)
+                    popmsg_sanitized = email.message_from_bytes(pyc_result_bytes, policy=policy.default)
                     #popmsg_sanitized = email.message_from_bytes(fix_header_folding(raw_bytes))
 
                     # 4. Aggiungi gli header di stato
                     scan_result = 'DISABLED'
                     if self.clamd_host and self.clamd_port:
-                        scan_result = asyncio.run(scan_bytes_with_clam_async(raw_bytes, self.clamd_host, self.clamd_port))
+                        scan_result =scan_bytes_with_clam_async(raw_bytes, self.clamd_host, self.clamd_port)
 
-                    if "VIRUS FOUND" in scan_result:
+                    if "FOUND" in scan_result:
                         popmsg_sanitized.add_header('X-ClamAV-Status', 'Infected')
                     elif scan_result.startswith('ERROR'):
                         popmsg_sanitized.add_header('X-ClamAV-Status', scan_result)
@@ -385,16 +375,6 @@ class POP3Message(object):
             except Exception as e:
                 logger.error(f'Error parsing message content: {e}')
 
-    # def get_headers(self):
-        # """Restituisce solo gli header del messaggio, in formato stringa."""
-        # if not self.content:
-            # return ''
-        # headers = []
-        # for header, value in self.content.items():
-            # headers.append(f"{header}: {value}")
-        # # Restituisce una stringa con gli header
-        # return '\r\n'.join(headers)
-
     def get_body(self):
         """Restituisce il corpo del messaggio in formato stringa."""
         if not self.content:
@@ -424,23 +404,30 @@ class POP3Message(object):
         return self.content.as_bytes() if self.content else b''
 
     def unique_id(self):
-        msgid = (self.content.get('Message-ID') or '').encode()
-        key = msgid or self.content.as_bytes()
+        msgid = (self.content.get('Message-ID') or '')
+        if msgid != '':
+            msgid = msgid.strip('<>')
+            return msgid
+        key = self.content.as_bytes()
         return md5(key).hexdigest()
 
     def __len__(self):
         return len(self.as_string().encode('utf-8', 'replace'))
 
-    # Aggiungere alla classe POP3Message
     def get_headers_only(self):
-        """Restituisce solo gli header del messaggio in formato bytes."""
-        headers = []
-        for header, value in self.content.items():
-            headers.append(f"{header}: {value}\r\n")
-         # Aggiungi una riga vuota per separare gli header dal corpo
-        headers.append("\r\n\r\n")
-        return "".join(headers)
+        """Restituisce solo gli header del messaggio in formato stringa, rimuovendo i duplicati."""
+        if not self.content:
+            return ''
 
+        # Usa un dizionario per rimuovere i duplicati
+        headers = {}
+        for header, value in self.content.items():
+            headers[header] = value
+        # Formatta gli header in una stringa
+        header_string = ''
+        for header, value in headers.items():
+            header_string += f"{header}: {value}\r\n"
+        return header_string
 
     def __len__(self):
         return len(self.as_string().encode('utf-8', 'replace'))
@@ -480,7 +467,7 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
             return f'invalid state for command {self.data.split()[0].decode("ascii", "replace")}'
         return None
 
-      # Modifica il metodo TOP in POP3Protocol
+    # Modifica il metodo TOP in POP3Protocol
     def do_top(self, msgid=None, lines=0):
         if msgid is None or lines is None:
             self.send_response(ERR)
@@ -495,20 +482,15 @@ class POP3ServerProtocol(socketserver.BaseRequestHandler):
         if lines == 0:
             headers = self.messages[msgid - 1].get_headers_only()
             self.send_response(OK, 'message follows')
-            self.sock.sendall(headers + b'.\r\n')
+            self.sock.sendall(headers.encode('utf-8', 'replace') + b'.\r\n')
             logger.debug(f'Sent headers for message {msgid}')
         else:
-            # Per TOP con righe, si può usare il metodo RETR e troncare, o implementare una logica più complessa.
-            # Per ora, si può reindirizzare a RETR e troncare manualmente.
-            # Oppure, per semplicità, fai RETR e poi tronca il corpo
-            full_message = self.messages[msgid - 1].content.as_bytes()
+            # Case "headers and body": get the body lines and combine with headers
+            body_lines = m.get_body().splitlines()[:lines]
+            response_lines = headers_list + [''] + body_lines
 
-            # Implementazione semplice che prende il messaggio completo e poi lo taglia
-            # per una soluzione più robusta, dovresti parse il messaggio e troncare solo il body
-            headers_end_index = full_message.find(b'\r\n\r\n') + 4
-            headers_and_body = full_message[:headers_end_index] + b'...\r\n'
             self.send_response(OK, 'message follows')
-            self.sock.sendall(headers_and_body + b'.\r\n')
+            self._send_multiline(response_lines)
             logger.debug(f'Sent TOP for message {msgid} with {lines} lines')
 
     # ---- POP3 commands ----
